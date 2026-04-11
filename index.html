@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global IoT Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #050505; color: white; }
+        .glass { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.05); }
+        .status-pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-5xl mx-auto">
+        <div class="flex justify-between items-center mb-10">
+            <h1 class="text-3xl font-extrabold italic">SMART <span class="text-blue-500">GUARD</span></h1>
+            <button onclick="toggleMute()" id="muteBtn" class="px-6 py-3 rounded-2xl glass flex items-center gap-2 border border-blue-500/30">
+                <i id="muteIcon" class="fas fa-volume-up text-blue-400"></i>
+                <span id="muteText">Âm thanh: BẬT</span>
+            </button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            <div class="glass rounded-[2rem] p-8">
+                <p class="text-gray-400 text-xs mb-2 uppercase">Nhiệt độ hiện tại</p>
+                <div class="text-7xl font-bold tracking-tighter"><span id="temperature">0.0</span><span class="text-3xl text-gray-500 ml-2">°C</span></div>
+                <div class="mt-6 flex gap-4">
+                    <input type="number" id="warningInput" class="bg-white/5 border border-white/10 rounded-xl px-4 py-2 w-full text-xl font-bold outline-none">
+                    <button onclick="publishControl({warnT: parseFloat(document.getElementById('warningInput').value)})" class="bg-blue-600 px-6 rounded-xl font-bold">SET</button>
+                </div>
+            </div>
+
+            <div class="glass rounded-[2rem] p-8">
+                <p class="text-gray-400 text-xs mb-2 uppercase">Nồng độ Gas</p>
+                <div class="text-7xl font-bold tracking-tighter"><span id="gasValue">0</span><span class="text-3xl text-gray-500 ml-2">PPM</span></div>
+                <div id="gasStatus" class="mt-4 inline-block px-4 py-1 rounded-lg text-xs font-bold uppercase border">ĐANG TẢI...</div>
+            </div>
+        </div>
+
+        <div class="glass rounded-[2rem] p-8 mb-8">
+            <h3 class="text-sm font-bold text-gray-400 mb-6 uppercase italic">Cài đặt ngưỡng Gas (PPM)</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div><label class="text-xs text-gray-500">Ngưỡng khí SẠCH</label><input type="number" id="gCleanIn" class="bg-white/5 border border-white/10 rounded-xl px-4 py-3 w-full text-2xl font-bold outline-none"></div>
+                <div><label class="text-xs text-gray-500">Ngưỡng khí NHẸ</label><input type="number" id="gLightIn" class="bg-white/5 border border-white/10 rounded-xl px-4 py-3 w-full text-2xl font-bold outline-none"></div>
+            </div>
+            <button onclick="setGasThresholds()" class="w-full mt-6 py-4 bg-blue-600 rounded-2xl font-bold shadow-xl transition-all active:scale-95">CẬP NHẬT NGƯỠNG GAS</button>
+        </div>
+
+        <div id="statusBox" class="rounded-[2rem] p-8 mb-8 text-center transition-all duration-500">
+            <h2 id="statusText" class="text-4xl font-black italic">ĐANG KẾT NỐI...</h2>
+        </div>
+
+        <div class="glass rounded-[2rem] p-8">
+            <p class="text-xs font-bold text-gray-400 mb-6 uppercase italic">Điều khiển LED</p>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <button onclick="publishControl({led:'auto'})" id="btn-auto" class="py-4 rounded-xl glass font-bold">AUTO</button>
+                <button onclick="publishControl({led:'on'})" id="btn-on" class="py-4 rounded-xl glass font-bold">BẬT</button>
+                <button onclick="publishControl({led:'off'})" id="btn-off" class="py-4 rounded-xl glass font-bold">TẮT</button>
+                <button onclick="publishControl({led:'blink'})" id="btn-blink" class="py-4 rounded-xl glass font-bold">CHỚP</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const TOPIC_MON = "iot/duong123/monitor";
+        const TOPIC_CON = "iot/duong123/control";
+        const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+        let audioCtx, alarmLoop, isMuted = false, lastDanger = 0;
+
+        function initAudio() { if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+        function playTone(freq, duration, vol) {
+            if(isMuted || !audioCtx) return;
+            const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.frequency.value = freq; gain.gain.value = vol;
+            osc.start(); setTimeout(() => osc.stop(), duration);
+        }
+
+        client.on("connect", () => { client.subscribe(TOPIC_MON); console.log("MQTT OK"); });
+
+        client.on("message", (t, m) => {
+            const data = JSON.parse(m.toString());
+            document.getElementById('temperature').innerText = data.temperature.toFixed(1);
+            document.getElementById('gasValue').innerText = data.gasValue;
+            document.getElementById('warningInput').value = data.warningTemp;
+            document.getElementById('gCleanIn').value = data.gasCleanThreshold;
+            document.getElementById('gLightIn').value = data.gasLightThreshold;
+
+            const gStatus = document.getElementById('gasStatus');
+            gStatus.innerText = data.gasStatus;
+            gStatus.className = `mt-4 inline-block px-4 py-1 rounded-lg text-xs font-bold border ${data.gasDanger ? 'bg-red-600 text-white status-pulse' : 'text-green-400 border-green-500/20'}`;
+
+            const sBox = document.getElementById('statusBox');
+            const sText = document.getElementById('statusText');
+            let dangerLevel = 0;
+
+            if(data.fireDanger) {
+                dangerLevel = 2; sText.innerText = "🚨 CHÁY NỔ NGUY HIỂM!";
+                sBox.className = "rounded-[2rem] p-8 mb-8 bg-red-700 status-pulse shadow-2xl shadow-red-500/50";
+            } else if(data.overTemp || data.gasDanger) {
+                dangerLevel = 1; sText.innerText = "⚠️ CẢNH BÁO";
+                sBox.className = "rounded-[2rem] p-8 mb-8 bg-orange-600 shadow-xl";
+            } else {
+                dangerLevel = 0; sText.innerText = "HỆ THỐNG AN TOÀN";
+                sBox.className = "rounded-[2rem] p-8 mb-8 glass border-green-500/30 text-green-500";
+            }
+
+            if(dangerLevel !== lastDanger) {
+                clearInterval(alarmLoop);
+                if(dangerLevel === 2) alarmLoop = setInterval(() => playTone(1200, 200, 0.5), 400);
+                else if(dangerLevel === 1) alarmLoop = setInterval(() => playTone(600, 400, 0.2), 1000);
+                lastDanger = dangerLevel;
+            }
+
+            ['auto','on','off','blink'].forEach(m => {
+                document.getElementById('btn-'+m).className = data.ledMode === m ? 'py-4 rounded-xl bg-white text-black font-bold scale-105' : 'py-4 rounded-xl glass font-bold';
+            });
+        });
+
+        function publishControl(obj) { client.publish(TOPIC_CON, JSON.stringify(obj)); }
+        function setGasThresholds() {
+            publishControl({
+                gClean: parseFloat(document.getElementById('gCleanIn').value),
+                gLight: parseFloat(document.getElementById('gLightIn').value)
+            });
+        }
+        function toggleMute() { isMuted = !isMuted; document.getElementById('muteText').innerText = isMuted ? "Âm thanh: TẮT" : "Âm thanh: BẬT"; }
+        window.onclick = () => initAudio();
+    </script>
+</body>
+</html>
